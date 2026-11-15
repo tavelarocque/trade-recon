@@ -13,6 +13,7 @@ Run:  python3 classify.py
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 
 import pandas as pd
 
@@ -47,19 +48,42 @@ def row_cash(row, suffix: str = "") -> float:
 
 
 def differing_fields(pair) -> list[str]:
-    """Which compare-fields disagree between our side and the broker's."""
+    """Which compare-fields disagree between our side and the broker's.
+
+    Money fields are compared after rounding, because two floats that print
+    the same can differ in the 15th decimal. A difference no bigger than the
+    field's tolerance in config.py is not a break.
+    """
     out = []
     for f in COMPARE_FIELDS:
         ours, theirs = pair[f + "_int"], pair[f + "_brk"]
         if f in MONEY_FIELDS:
-            # Money is compared after rounding. Two floats that print the same
-            # can differ in the 15th decimal, and that is not a break.
-            same = round(ours, MONEY_FIELDS[f]) == round(theirs, MONEY_FIELDS[f])
+            gap = abs(round(ours - theirs, MONEY_FIELDS[f]))
+            same = gap <= config.TOLERANCE.get(f, 0.0) + 1e-9
         else:
             same = ours == theirs
         if not same:
             out.append(f)
     return out
+
+
+def within_tolerance(result: MatchResult) -> pd.DataFrame:
+    """Matched pairs that agree within tolerance but not to the cent.
+
+    These are not breaks. They are listed so the cents are never lost: the
+    totals check adds them back, and the report shows how much was waved
+    through. A tolerance that hides money without counting it is a bug.
+    """
+    rows = []
+    for _, pair in result.matched.iterrows():
+        if differing_fields(pair):
+            continue
+        cash_diff = round(row_cash(pair, "_int") - row_cash(pair, "_brk"), 2)
+        if cash_diff != 0:
+            rows.append({"trade_id": pair["trade_id"], "broker_row": pair["broker_row"],
+                         "currency": pair["currency_int"], "our_fees": pair["fees_int"],
+                         "broker_fees": pair["fees_brk"], "cash_diff": cash_diff})
+    return pd.DataFrame(rows, columns=["trade_id", "broker_row", "currency", "our_fees", "broker_fees", "cash_diff"])
 
 
 def size(cash_diff: float, notional: float, currency: str) -> dict:
@@ -148,24 +172,45 @@ def classify(result: MatchResult) -> pd.DataFrame:
                           na_position="last").reset_index(drop=True)
 
 
-def totals_check(internal: pd.DataFrame, broker: pd.DataFrame, breaks: pd.DataFrame) -> pd.DataFrame:
+def totals_check(internal: pd.DataFrame, broker: pd.DataFrame, breaks: pd.DataFrame,
+                 tolerated: pd.DataFrame | None = None) -> pd.DataFrame:
     """Do the breaks explain the entire gap between the two books?
 
-    Per currency:  (our total cash) - (broker's total cash)  must equal
-    the sum of cash_diff over all breaks, to the cent. This is computed from
-    the two raw books, so it does not depend on the matching being right.
+    Per currency:  (our total cash) - (broker's total cash)  must equal the
+    sum of cash_diff over all breaks, plus the cents waved through as within
+    tolerance, to the cent. The gap is computed from the two raw books, line
+    by line, so it does not depend on the matching being right.
     """
     ours = internal.apply(row_cash, axis=1).groupby(internal["currency"]).sum()
     theirs = broker.apply(row_cash, axis=1).groupby(broker["currency"]).sum()
-    explained = breaks.groupby("currency")["cash_diff"].sum()
+    explained = breaks.groupby("currency")["cash_diff"].sum().astype(float)
 
     out = pd.DataFrame({"internal_cash": ours, "broker_cash": theirs}).fillna(0.0)
     out["gap"] = out["internal_cash"] - out["broker_cash"]
     out["sum_of_breaks"] = explained.reindex(out.index).fillna(0.0)
+    waved = (tolerated.groupby("currency")["cash_diff"].sum() if tolerated is not None and len(tolerated)
+             else pd.Series(dtype=float))
+    out["within_tolerance"] = waved.reindex(out.index).fillna(0.0)
     out = out.round(2)
-    out["unexplained"] = (out["gap"] - out["sum_of_breaks"]).round(2)
+    out["unexplained"] = (out["gap"] - out["sum_of_breaks"] - out["within_tolerance"]).round(2) + 0.0  # no "-0.0"
     out["ok"] = out["unexplained"] == 0
     return out
+
+
+@dataclass
+class Reconciliation:
+    result: MatchResult
+    breaks: pd.DataFrame
+    tolerated: pd.DataFrame
+    totals: pd.DataFrame
+
+
+def reconcile(internal: pd.DataFrame, broker: pd.DataFrame) -> Reconciliation:
+    """The whole engine in one call: match, classify, and check the totals."""
+    result = match_all(internal, broker)
+    breaks = classify(result)
+    tolerated = within_tolerance(result)
+    return Reconciliation(result, breaks, tolerated, totals_check(internal, broker, breaks, tolerated))
 
 
 def main() -> None:
@@ -177,7 +222,8 @@ def main() -> None:
 
     internal = load_internal(args.internal)
     broker = load_broker(args.broker)
-    breaks = classify(match_all(internal, broker))
+    rec = reconcile(internal, broker)
+    breaks = rec.breaks
 
     print(f"{len(breaks)} breaks. Top {args.top} by impact in USD:")
     cols = ["break_type", "trade_id", "symbol", "currency", "internal_value", "broker_value",
@@ -190,7 +236,9 @@ def main() -> None:
           .sort_values("impact_usd", ascending=False).to_string())
     print()
     print("totals check (local currency, never summed across):")
-    print(totals_check(internal, broker, breaks).to_string())
+    print(rec.totals.to_string())
+    print()
+    print(f"{len(rec.tolerated)} matched trades differ by a cent or less in fees and are not reported as breaks")
 
 
 if __name__ == "__main__":

@@ -18,10 +18,10 @@ import config
 import generate
 import inject
 from calendars import expected_settle_date, is_trading_day
-from classify import classify, totals_check
+from classify import classify, reconcile, totals_check
 from common import signed_cash
 from evaluate import score
-from match import match_all, match_by_id
+from match import fold_fills, match_all, match_by_id
 from normalize import load_broker, load_internal, parse_date
 from settlement import annotate, audit_internal
 
@@ -47,7 +47,11 @@ def pipeline(seed: int, scale: int = 1, breaks: bool = True, noise: bool = True)
 
 
 def engine(internal, broker):
-    return classify(match_all(internal, broker))
+    return reconcile(internal, broker).breaks
+
+
+def ids(noise_log, *types):
+    return set(noise_log.loc[noise_log["noise_type"].isin(types), "trade_id"])
 
 
 # ---------------------------------------------------------------- the headline
@@ -64,7 +68,7 @@ def test_every_planted_break_is_found_and_nothing_else(seed):
 @pytest.mark.parametrize("seed", SEEDS)
 def test_totals_reconcile_to_the_cent(seed):
     internal, broker, _, _ = pipeline(seed)
-    totals = totals_check(internal, broker, engine(internal, broker))
+    totals = reconcile(internal, broker).totals
     assert totals["ok"].all(), totals.to_string()
 
 
@@ -72,10 +76,10 @@ def test_totals_reconcile_to_the_cent(seed):
 def test_three_times_as_many_breaks_and_noise(seed):
     internal, broker, truth, _ = pipeline(seed, scale=3)
     assert len(truth) == 3 * sum(config.BREAK_COUNTS.values())
-    breaks = engine(internal, broker)
-    s = score(breaks, truth)
+    rec = reconcile(internal, broker)
+    s = score(rec.breaks, truth)
     assert s["recall"] == 1.0 and s["precision"] == 1.0
-    assert totals_check(internal, broker, breaks)["ok"].all()
+    assert rec.totals["ok"].all()
 
 
 # ------------------------------------------------------------ false positives
@@ -98,16 +102,20 @@ def test_blank_references_are_repaired_not_reported(seed):
     internal, broker, _, noise_log = pipeline(seed)
     result = match_all(internal, broker)
     repaired = set(result.matched.loc[result.matched["match_method"] == "fallback", "trade_id"])
-    assert repaired == set(noise_log.loc[noise_log["noise_type"] == "MISSING_ID", "trade_id"])
+    assert repaired == ids(noise_log, "MISSING_ID", "SPLIT_NO_REF")
     assert result.unmatched_broker.empty
 
 
 def test_without_the_fallback_precision_drops():
-    """Documents why night 6 exists: ID-only matching reports 20 false rows."""
-    internal, broker, truth, _ = pipeline(42)
-    s = score(classify(match_by_id(internal, broker)), truth)
+    """Documents why the fallback exists: without it, every trade the broker
+    sent with no reference shows up twice, as missing and as unrecognised."""
+    internal, broker, truth, noise_log = pipeline(42)
+    result = match_by_id(internal, fold_fills(internal, broker))
+    s = score(classify(result), truth)
+    no_ref = ids(noise_log, "MISSING_ID", "SPLIT_NO_REF")
     assert s["recall"] == 1.0
-    assert s["reported"] == 60 and s["precision"] == pytest.approx(40 / 60)
+    assert s["reported"] == len(truth) + len(no_ref) + len(result.unmatched_broker)
+    assert s["precision"] < 0.6
 
 
 def test_fallback_refuses_to_guess_between_two_candidates():
@@ -122,6 +130,118 @@ def test_fallback_refuses_to_guess_between_two_candidates():
     assert len(result.unmatched_broker) == 1
 
 
+# ------------------------------------------------------ fills and tolerances
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_fills_are_folded_into_one_trade_and_not_reported(seed):
+    internal, broker, truth, noise_log = pipeline(seed)
+    rec = reconcile(internal, broker)
+    folded = set(rec.result.matched.loc[rec.result.matched["fills"] > 1, "trade_id"])
+    assert folded == ids(noise_log, "SPLIT_FILL", "SPLIT_NO_REF")
+    assert not (set(rec.breaks["trade_id"].dropna()) & folded)
+    # The average price over the fills equals our price on every folded trade.
+    m = rec.result.matched[rec.result.matched["fills"] > 1]
+    assert ((m["price_int"] - m["price_brk"]).abs() < 1e-6).all()
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_one_cent_fee_differences_are_tolerated_and_still_counted(seed):
+    internal, broker, _, noise_log = pipeline(seed)
+    rec = reconcile(internal, broker)
+    assert set(rec.tolerated["trade_id"]) == ids(noise_log, "FEE_ROUNDING")
+    assert (rec.tolerated["cash_diff"].abs().round(2) == 0.01).all()
+    # Leave the tolerated cents out and the books no longer add up.
+    assert not totals_check(internal, broker, rec.breaks)["ok"].all()
+
+
+def test_zero_tolerance_turns_rounding_into_false_breaks(monkeypatch):
+    internal, broker, truth, noise_log = pipeline(42)
+    monkeypatch.setitem(config.TOLERANCE, "fees", 0.0)
+    rec = reconcile(internal, broker)
+    s = score(rec.breaks, truth)
+    assert s["recall"] == 1.0
+    assert s["reported"] == len(truth) + len(ids(noise_log, "FEE_ROUNDING"))
+    assert rec.totals["ok"].all() and rec.tolerated.empty
+
+
+def test_a_loose_tolerance_hides_real_breaks_but_never_hides_the_money(monkeypatch):
+    internal, broker, truth, _ = pipeline(42)
+    monkeypatch.setitem(config.TOLERANCE, "fees", 1000.0)
+    rec = reconcile(internal, broker)
+    s = score(rec.breaks, truth)
+    assert s["recall"] < 1.0 and all(k[1] == "FEE" for k in s["missed"])
+    assert rec.totals["ok"].all()          # the hidden fee breaks are still in the totals
+    assert len(rec.tolerated) > 20
+
+
+def _one_split(noise_log, broker, kind):
+    tid = sorted(ids(noise_log, kind))[0]
+    return tid
+
+
+def test_a_missing_fill_is_a_quantity_break():
+    internal, broker, _, noise_log = pipeline(42)
+    tid = _one_split(noise_log, broker, "SPLIT_FILL")
+    lines = broker[broker["trade_id"] == tid]
+    short = broker.drop(index=lines.index[-1])          # the broker never sent the last fill
+    rec = reconcile(internal, short)
+    row = rec.breaks[rec.breaks["trade_id"] == tid]
+    assert list(row["break_type"]) in (["QUANTITY"], ["MULTIPLE"])
+    assert "quantity" in row["field"].item()
+    assert rec.totals["ok"].all()
+
+
+def test_equal_fills_at_one_price_are_fills_not_duplicates():
+    """Two identical lines are duplicates only if they do NOT add up to ours."""
+    internal, broker, _, noise_log = pipeline(42)
+    tid = sorted(t for t in ids(noise_log, "SPLIT_FILL")
+                 if len(broker[broker["trade_id"] == t]) == 2)[0]
+    internal, b = internal.copy(), broker.copy()
+    idx = b.index[b["trade_id"] == tid]
+    i = internal.index[internal["trade_id"] == tid][0]
+    half_fee = round(internal.loc[i, "fees"] / 2, 2)
+    internal.loc[i, "fees"] = round(2 * half_fee, 2)     # make our fee split into two equal cents
+    b.loc[idx, "price"] = internal.loc[i, "price"]       # both fills at our price
+    b.loc[idx, "fees"] = half_fee                        # the two lines are now exact copies
+    rec = reconcile(internal, b)
+    assert tid not in set(rec.breaks["trade_id"].dropna())
+    assert rec.result.duplicates[rec.result.duplicates["trade_id"] == tid].empty
+
+
+def test_fills_that_disagree_on_settlement_are_not_folded_silently():
+    internal, broker, _, noise_log = pipeline(42)
+    tid = _one_split(noise_log, broker, "SPLIT_FILL")
+    b = broker.copy()
+    i = b.index[b["trade_id"] == tid][0]
+    b.loc[i, "settle_date"] = date(2026, 12, 1)
+    rec = reconcile(internal, b)
+    assert tid in set(rec.breaks["trade_id"].dropna())   # it must surface, in some form
+
+
+def test_unreferenced_fills_are_not_paired_when_they_do_not_add_up():
+    internal, broker, _, noise_log = pipeline(42)
+    tid = _one_split(noise_log, broker, "SPLIT_NO_REF")
+    ours = internal[internal["trade_id"] == tid].iloc[0]
+    b = broker.copy()
+    cell = (b["trade_id"].isna() & (b["symbol"] == ours["symbol"]) & (b["side"] == ours["side"])
+            & (b["trade_date"] == ours["trade_date"]))
+    assert cell.sum() >= 2
+    b.loc[b.index[cell][0], "quantity"] += 100
+    result = match_all(internal, b)
+    assert tid in set(result.unmatched_internal["trade_id"])
+    assert len(result.unmatched_broker) == cell.sum()
+
+
+def test_unreferenced_fills_are_not_paired_when_two_of_ours_could_fit():
+    internal, broker, _, noise_log = pipeline(42)
+    tid = _one_split(noise_log, broker, "SPLIT_NO_REF")
+    twin = internal[internal["trade_id"] == tid].copy()
+    twin["trade_id"] = "T999998"
+    internal2 = pd.concat([internal, twin], ignore_index=True)
+    result = match_all(internal2, broker)
+    assert {tid, "T999998"} <= set(result.unmatched_internal["trade_id"])
+
+
 # ------------------------------------------------------------------ bookkeeping
 
 @pytest.mark.parametrize("seed", SEEDS)
@@ -129,7 +249,8 @@ def test_no_row_is_lost_or_counted_twice(seed):
     internal, broker, _, _ = pipeline(seed)
     r = match_all(internal, broker)
     assert len(r.matched) + len(r.unmatched_internal) == len(internal)
-    assert len(r.matched) + len(r.duplicates) + len(r.unmatched_broker) == len(broker)
+    # Every broker line is counted once: a matched trade may hold several fills.
+    assert r.matched["fills"].sum() + len(r.duplicates) + len(r.unmatched_broker) == len(broker)
 
 
 @pytest.mark.parametrize("seed", [1, 2, 3])
@@ -153,9 +274,10 @@ def test_generated_blotter_obeys_its_own_rules():
 
 def test_hiding_one_break_fails_the_totals_check():
     internal, broker, _, _ = pipeline(42)
-    breaks = engine(internal, broker)
-    cash_breaks = breaks[breaks["cash_diff"] != 0]
-    assert not totals_check(internal, broker, breaks.drop(cash_breaks.index[0]))["ok"].all()
+    rec = reconcile(internal, broker)
+    cash_breaks = rec.breaks[rec.breaks["cash_diff"] != 0]
+    hidden = rec.breaks.drop(cash_breaks.index[0])
+    assert not totals_check(internal, broker, hidden, rec.tolerated)["ok"].all()
 
 
 def test_ranking_is_biggest_first_and_settlement_breaks_are_sized_by_notional():
@@ -170,19 +292,22 @@ def test_ranking_is_biggest_first_and_settlement_breaks_are_sized_by_notional():
 # -------------------------------------------------------------- unplanted cases
 
 def test_two_wrong_fields_report_once_and_static_data_is_not_ignored():
-    internal, broker, truth, _ = pipeline(42)
+    internal, broker, truth, noise_log = pipeline(42)
     broker = broker.copy()
-    clean = broker[broker["trade_id"].notna() & ~broker["trade_id"].isin(truth["trade_id"])]
+    special = ids(noise_log, "SPLIT_FILL", "SPLIT_NO_REF", "FEE_ROUNDING")
+    clean = broker[broker["trade_id"].notna() & ~broker["trade_id"].isin(truth["trade_id"])
+                   & ~broker["trade_id"].isin(special)]
     a, c = clean.index[0], clean.index[1]
     broker.loc[a, "price"] += 1.0
     broker.loc[a, "fees"] += 5.0
     broker.loc[c, "account"] = "ACC-999"
-    breaks = engine(internal, broker)
+    rec = reconcile(internal, broker)
+    breaks = rec.breaks
     row_a = breaks[breaks["trade_id"] == broker.loc[a, "trade_id"]]
     row_c = breaks[breaks["trade_id"] == broker.loc[c, "trade_id"]]
     assert list(row_a["break_type"]) == ["MULTIPLE"]
     assert list(row_c["break_type"]) == ["STATIC_DATA"]
-    assert totals_check(internal, broker, breaks)["ok"].all()
+    assert rec.totals["ok"].all()
 
 
 # ------------------------------------------------------------------ settlement

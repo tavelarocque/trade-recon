@@ -17,9 +17,8 @@ from pathlib import Path
 import config
 import generate
 import inject
-from classify import classify, totals_check
+from classify import reconcile
 from evaluate import score, summary
-from match import match_all
 from normalize import load_broker, load_internal
 from report import write_report
 
@@ -35,11 +34,9 @@ def run_seed(seed: int, outdir: Path):
 
     # The engine: two files in, a break list out. No answer key.
     broker = load_broker(outdir / "broker_statement.csv")
-    result = match_all(internal, broker)
-    breaks = classify(result)
-    totals = totals_check(internal, broker, breaks)
+    rec = reconcile(internal, broker)
 
-    return result, breaks, totals, score(breaks, truth), (internal, broker)
+    return rec, score(rec.breaks, truth), (internal, broker)
 
 
 def parse_seeds(text: str) -> list[int]:
@@ -60,20 +57,24 @@ def main() -> None:
         all_ok = True
         with tempfile.TemporaryDirectory() as tmp:
             for seed in parse_seeds(args.seeds):
-                _, _, totals, s, _ = run_seed(seed, Path(tmp) / str(seed))
-                ok = bool(totals["ok"].all())
+                rec, s, _ = run_seed(seed, Path(tmp) / str(seed))
+                ok = bool(rec.totals["ok"].all())
                 all_ok &= ok and s["recall"] == 1 and s["precision"] == 1
                 print(f"{seed:>5} {s['planted']:>8} {s['reported']:>9} {s['recall']:>8.1%} {s['precision']:>10.1%} {'ok' if ok else 'FAIL':>7}")
         print("every seed perfect" if all_ok else "at least one seed is not perfect")
         sys.exit(0 if all_ok else 1)  # a non-zero exit fails the CI job
 
-    result, breaks, totals, s, (internal, broker) = run_seed(args.seed, Path("data"))
+    rec, s, (internal, broker) = run_seed(args.seed, Path("data"))
+    result, breaks, totals = rec.result, rec.breaks, rec.totals
     write_report(internal, broker, internal["trade_date"].max())
     print(f"seed {args.seed}: {len(breaks)} breaks reported")
     print(breaks.groupby("break_type").agg(count=("impact_usd", "size"), impact_usd=("impact_usd", "sum"))
           .round(2).sort_values("impact_usd", ascending=False).to_string())
     print()
-    print(f"blank references repaired by the fallback match: {result.counts()['of which by fallback']}")
+    c = result.counts()
+    print(f"paired without a usable reference (fallback match): {c['of which by fallback']}")
+    print(f"trades the broker reported as several fills, folded into one: {c['of which from several fills']}")
+    print(f"fee differences within tolerance, not reported as breaks: {len(rec.tolerated)}")
     print()
     print("totals check:")
     print(totals.to_string())

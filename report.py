@@ -19,8 +19,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from classify import classify, totals_check
-from match import match_all
+import config
+from classify import reconcile
 from normalize import load_broker, load_internal
 from settlement import annotate, audit_internal
 
@@ -61,8 +61,10 @@ def suggested_action(b) -> str:
     return f"Several fields differ ({b['field']}): review the whole trade with {broker}."
 
 
-def build_report(internal: pd.DataFrame, broker: pd.DataFrame, as_of: date) -> pd.DataFrame:
-    breaks = annotate(classify(match_all(internal, broker)), as_of)
+def build_report(internal: pd.DataFrame, broker: pd.DataFrame, as_of: date, breaks: pd.DataFrame | None = None) -> pd.DataFrame:
+    if breaks is None:
+        breaks = reconcile(internal, broker).breaks
+    breaks = annotate(breaks, as_of)
     breaks["suggested_action"] = [suggested_action(b) for _, b in breaks.iterrows()]
     breaks.insert(0, "rank", range(1, len(breaks) + 1))
     return breaks[REPORT_COLUMNS]
@@ -95,8 +97,10 @@ def md_table(df: pd.DataFrame, money: tuple[str, ...] = ()) -> str:
     return "\n".join([head, rule] + rows)
 
 
-def to_markdown(report, totals, internal, broker, as_of, repaired, own_errors, top=15) -> str:
-    money = ("impact_usd", "cash_diff", "internal_cash", "broker_cash", "gap", "sum_of_breaks", "unexplained")
+def to_markdown(report, totals, internal, broker, as_of, repaired, own_errors, folded, tolerated, top=15) -> str:
+    money = ("impact_usd", "cash_diff", "internal_cash", "broker_cash", "gap", "sum_of_breaks",
+             "within_tolerance", "unexplained")
+    waved = ", ".join(f"{v:,.2f} {c}" for c, v in tolerated.groupby("currency")["cash_diff"].sum().round(2).items()) or "none"
     out = [
         "# Trade break report",
         "",
@@ -108,7 +112,8 @@ def to_markdown(report, totals, internal, broker, as_of, repaired, own_errors, t
         "",
         "## Does it add up?",
         "",
-        "Our total cash minus the broker's total cash, compared with the sum of the breaks, in each currency.",
+        "Our total cash minus the broker's total cash, compared with the sum of the breaks plus the cents "
+        "accepted as within tolerance, in each currency.",
         "",
         md_table(totals.reset_index(), money),
         "",
@@ -132,7 +137,9 @@ def to_markdown(report, totals, internal, broker, as_of, repaired, own_errors, t
         "",
         "## Notes",
         "",
-        f"- {repaired} broker lines had no usable trade reference and were paired by symbol, side, quantity and trade date. They are not breaks.",
+        f"- {repaired} trades had no usable reference on the broker's side and were paired by symbol, side, quantity and trade date. They are not breaks.",
+        f"- {folded} trades were reported by the broker as several fills. Each was folded into one line (summed quantity, average price weighted by quantity, summed fees) before comparing.",
+        f"- {len(tolerated)} matched trades differ in fees by no more than the tolerance of {config.TOLERANCE['fees']:.2f}. They are not breaks. Net amount accepted: {waved}.",
         f"- {own_errors} of our own trades have a settlement date that disagrees with the calendar.",
         "- Impact is the absolute cash difference in USD at a fixed rate. Where no cash is in dispute, it is the trade's notional, marked as notional at risk.",
         "- The full list is in `break_report.csv`.",
@@ -142,16 +149,17 @@ def to_markdown(report, totals, internal, broker, as_of, repaired, own_errors, t
 
 
 def write_report(internal, broker, as_of, outdir: Path = Path("reports")):
-    result = match_all(internal, broker)
-    report = build_report(internal, broker, as_of)
-    totals = totals_check(internal, broker, classify(result))
+    rec = reconcile(internal, broker)
+    result, totals = rec.result, rec.totals
+    report = build_report(internal, broker, as_of, rec.breaks)
     repaired = int((result.matched["match_method"] == "fallback").sum())
+    folded = int((result.matched["fills"] > 1).sum())
     own_errors = len(audit_internal(internal))
 
     outdir.mkdir(parents=True, exist_ok=True)
     report.to_csv(outdir / "break_report.csv", index=False)
     (outdir / "break_report.md").write_text(
-        to_markdown(report, totals, internal, broker, as_of, repaired, own_errors))
+        to_markdown(report, totals, internal, broker, as_of, repaired, own_errors, folded, rec.tolerated))
     return report, totals
 
 

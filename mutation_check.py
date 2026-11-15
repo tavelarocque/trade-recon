@@ -2,7 +2,7 @@
 
 A test suite that passes proves little on its own, because a suite that
 checks nothing also passes. This script copies the project to a temporary
-folder twelve times, breaks one thing in each copy, and runs the tests.
+folder once per planted bug, breaks one thing in each copy, and runs the tests.
 Every copy must fail. A copy that still passes is a bug the suite cannot see.
 
 Nothing in the real project folder is changed.
@@ -36,8 +36,16 @@ BUGS = [
      'for col in ("trade_id", "side", "currency", "account", "broker"):'),
     ("compact dates read day-first", "config.py", '"%Y%m%d"]', '"%Y%d%m"]'),
     ("fallback match switched off", "match.py",
-     "    return match_fallback(match_by_id(internal, broker), internal, broker)",
-     "    return match_by_id(internal, broker)"),
+     "    result = match_fallback(result, internal, lines)\n", ""),
+    ("fills treated as duplicates, not folded", "match.py",
+     "    lines = fold_fills(internal, broker)\n", "    lines = with_line_columns(broker)\n"),
+    ("unreferenced fills paired without checking they add up", "match.py",
+     'if len(mine) != 1 or int(lines["quantity"].sum()) != int(mine.iloc[0]["quantity"]):',
+     "if len(mine) != 1:"),
+    ("fee tolerance set to a dollar", "config.py",
+     'TOLERANCE = {"price": 0.0, "fees": 0.01}', 'TOLERANCE = {"price": 0.0, "fees": 1.0}'),
+    ("tolerated cents dropped from the totals check", "classify.py",
+     '(out["gap"] - out["sum_of_breaks"] - out["within_tolerance"])', '(out["gap"] - out["sum_of_breaks"])'),
     ("fallback match guesses between two candidates", "match.py",
      "    ours_unique = ours[~ours.duplicated(FALLBACK_KEY, keep=False)]",
      "    ours_unique = ours.drop_duplicates(FALLBACK_KEY)"),

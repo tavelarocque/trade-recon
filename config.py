@@ -84,12 +84,19 @@ BREAK_COUNTS = {
     "DUPLICATE": 4,    # broker shows the trade twice
 }
 
+# The smallest fee difference the generator plants as a real FEE break.
+# One cent is rounding (see FEE_ROUNDING below); two cents or more is a break.
+MIN_FEE_BREAK = 0.02
+
 # Noise: formatting mess that is NOT a disagreement. A careful analyst cleans
 # it up first. The engine must never report any of this as a break.
 NOISE_COUNTS = {
-    "SYMBOL_CASE": 25,  # "aapl" instead of "AAPL"
-    "WHITESPACE": 25,   # " AAPL  " instead of "AAPL"
-    "MISSING_ID": 10,   # broker left our trade reference blank
+    "SYMBOL_CASE": 25,   # "aapl" instead of "AAPL"
+    "WHITESPACE": 25,    # " AAPL  " instead of "AAPL"
+    "MISSING_ID": 10,    # broker left our trade reference blank
+    "FEE_ROUNDING": 20,  # broker's fee is one cent off ours: rounding, not a dispute
+    "SPLIT_FILL": 12,    # broker reports one trade as 2 or 3 fills under our reference
+    "SPLIT_NO_REF": 6,   # the same, but with no reference on any of the fills
 }
 DATE_FORMAT_NOISE = 0.3  # fraction of broker rows whose dates are not ISO
 
@@ -97,3 +104,13 @@ DATE_FORMAT_NOISE = 0.3  # fraction of broker rows whose dates are not ISO
 # a format like 03/04/2026 could mean 3 April or 4 March and cannot be fixed
 # by code, only by asking the broker.
 BROKER_DATE_FORMATS = ["%Y-%m-%d", "%d-%b-%Y", "%Y%m%d"]
+
+# ---------------------------------------------------------------------------
+# Tolerances: how far apart two values may be and still count as agreeing
+# ---------------------------------------------------------------------------
+# In local currency units. Brokers round fees their own way, so a one-cent
+# fee difference is logged and totalled but not raised as a break. Prices get
+# no tolerance: one tick on a large trade is real money. Raising a tolerance
+# hides real breaks, so every tolerated cent is still counted in the totals
+# check and shown in the report.
+TOLERANCE = {"price": 0.0, "fees": 0.01}

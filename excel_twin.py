@@ -16,6 +16,7 @@ Run:  python3 report.py      (writes reports/break_report.csv first)
 """
 from __future__ import annotations
 
+import argparse
 from datetime import date
 from pathlib import Path
 
@@ -139,46 +140,60 @@ def build_twin(internal, broker_raw, report, path: Path) -> None:
         return f"Broker!${col}$2:${col}${lb}"
 
     # ---- Recon: one row per trade of ours, lined up with the Internal sheet
-    heads = ["trade_id", "symbol", "currency", "broker", "id_hits", "fallback_hits", "b_side", "b_qty",
-             "b_px", "b_fee", "b_settle", "broker_cash", "cash_diff", "break_type", "is_break", "impact_usd"]
+    heads = ["trade_id", "symbol", "currency", "broker", "id_hits", "id_qty", "fallback_hits", "cell_qty",
+             "b_side", "b_qty", "b_px", "b_fee", "b_settle", "broker_cash", "cash_diff", "break_type",
+             "is_break", "impact_usd"]
     ws_r.append(heads)
     for r in range(2, li + 1):
-        fb_criteria = (f"{B('L')},0,{B('M')},B{r},{B('N')},Internal!G{r},"
-                       f"{B('D')},Internal!H{r},{B('O')},Internal!C{r}")
-        lookup = lambda col: f'=IF(E{r}=0,"",INDEX({B(col)},MATCH(A{r},{B("A")},0)))'
+        cell_criteria = f"{B('L')},0,{B('M')},B{r},{B('N')},Internal!G{r},{B('O')},Internal!C{r}"
+        exact_criteria = f"{cell_criteria},{B('D')},Internal!H{r}"
+        lookup = lambda col: f'=IF(E{r}<>1,"",INDEX({B(col)},MATCH(A{r},{B("A")},0)))'
+        # Paired through several unreferenced fills: no ID hit, no exact line,
+        # and the unreferenced lines for this symbol, side and date add up to ours.
+        fills_no_ref = f"AND(E{r}=0,G{r}=0,H{r}=Internal!H{r})"
         row = [
             f"=Internal!A{r}", f"=Internal!E{r}", f"=Internal!J{r}", f"=Internal!M{r}",
             f"=COUNTIFS({B('A')},A{r})",                                   # how many broker lines carry our ID
-            f"=IF(E{r}=0,COUNTIFS({fb_criteria}),0)",                      # no ID: is there one blank-ref line that fits?
+            f"=SUMIFS({B('D')},{B('A')},A{r})",                            # and how much quantity they add up to
+            f"=IF(E{r}=0,COUNTIFS({exact_criteria}),0)",                   # no ID: one unreferenced line that fits exactly?
+            f"=IF(AND(E{r}=0,G{r}=0),SUMIFS({B('D')},{cell_criteria}),0)",  # or several fills that add up?
             lookup("N"), lookup("D"), lookup("E"), lookup("I"), lookup("P"),
-            f"=SUMIFS({B('Q')},{B('A')},A{r})+IF(F{r}=1,SUMIFS({B('Q')},{fb_criteria}),0)",
-            f"=ROUND(Internal!O{r}-L{r},2)",
-            (f'=IF(E{r}=0,IF(F{r}=1,"","MISSING"),IF(E{r}>1,"DUPLICATE",'
-             f'IF(G{r}<>Internal!G{r},"SIDE",IF(H{r}<>Internal!H{r},"QUANTITY",'
-             f'IF(ROUND(I{r}-Internal!I{r},4)<>0,"PRICE",IF(ROUND(J{r}-Internal!N{r},2)<>0,"FEE",'
-             f'IF(K{r}<>Internal!D{r},"SETTLE_DATE","")))))))'),
-            f'=IF(N{r}="",0,1)',
-            (f"=IF(O{r}=0,0,ROUND(ROUND(IF(M{r}<>0,ABS(M{r}),Internal!H{r}*Internal!I{r}),2)"
+            (f"=SUMIFS({B('Q')},{B('A')},A{r})+IF(G{r}=1,SUMIFS({B('Q')},{exact_criteria}),"
+             f"IF({fills_no_ref},SUMIFS({B('Q')},{cell_criteria}),0))"),
+            f"=ROUND(Internal!O{r}-N{r},2)",
+            (f'=IF(E{r}=0,IF(OR(G{r}=1,{fills_no_ref}),"","MISSING"),'
+             f'IF(E{r}>1,IF(F{r}=Internal!H{r},"","DUPLICATE"),'
+             f'IF(I{r}<>Internal!G{r},"SIDE",IF(J{r}<>Internal!H{r},"QUANTITY",'
+             f'IF(ROUND(K{r}-Internal!I{r},4)<>0,"PRICE",'
+             f'IF(ABS(ROUND(L{r}-Internal!N{r},2))>Summary!$C$7,"FEE",'
+             f'IF(M{r}<>Internal!D{r},"SETTLE_DATE","")))))))'),
+            f'=IF(P{r}="",0,1)',
+            (f"=IF(Q{r}=0,0,ROUND(ROUND(IF(O{r}<>0,ABS(O{r}),Internal!H{r}*Internal!I{r}),2)"
              f'*IF(C{r}="USD",Summary!$C$5,Summary!$C$6),2))'),
         ]
         ws_r.append(row)
         for c in (1, 2, 3, 4):
             ws_r.cell(row=r, column=c).font = LINK
-        ws_r.cell(row=r, column=11).number_format = DATE
-        for c in (9, 10):
+        ws_r.cell(row=r, column=13).number_format = DATE
+        for c in (11, 12):
             ws_r.cell(row=r, column=c).number_format = "0.00"
-        for c in (12, 13, 16):
+        for c in (14, 15, 18):
             ws_r.cell(row=r, column=c).number_format = MONEY
     style_header(ws_r, 1, len(heads))
     ws_r.freeze_panes = "B2"
-    set_widths(ws_r, {"A": 10, "B": 10, "K": 12, "L": 15, "M": 15, "N": 14, "P": 15})
-    ws_r["E1"].comment = Comment("COUNTIFS on the broker's ref column. 0 means no line carries our ID, 2 means a duplicate. "
-                                 "XLOOKUP alone would hide a duplicate, because it returns only the first hit.", "trade-recon")
-    ws_r["F1"].comment = Comment("The fallback match: for a trade with no ID hit, count broker lines with a blank ref "
-                                 "and the same symbol, side, quantity and trade date. Exactly 1 means paired.", "trade-recon")
-    ws_r["G1"].comment = Comment("INDEX/MATCH lookup. The Excel 365 equivalent is "
-                                 "=XLOOKUP(A2,Broker!$A$2:$A$500,Broker!$N$2:$N$500,\"\")", "trade-recon")
-    ws_r["O1"].comment = Comment("A 0/1 flag. Counting breaks with COUNTIFS(range,\"<>\") would be wrong here: "
+    set_widths(ws_r, {"A": 10, "B": 10, "G": 13, "M": 12, "N": 15, "O": 15, "P": 14, "R": 15})
+    ws_r["E1"].comment = Comment("COUNTIFS on the broker's ref column. 0 means no line carries our ID. 2 or more means "
+                                 "either a duplicate or several fills. XLOOKUP alone would hide both, because it "
+                                 "returns only the first hit.", "trade-recon")
+    ws_r["F1"].comment = Comment("The quantity on all the broker lines carrying our ID. If it equals our quantity the "
+                                 "lines are fills of one trade. If it is double ours, the trade was sent twice.", "trade-recon")
+    ws_r["G1"].comment = Comment("The one-to-one fallback: for a trade with no ID hit, count broker lines with a blank "
+                                 "ref and the same symbol, side, quantity and trade date. Exactly 1 means paired.", "trade-recon")
+    ws_r["H1"].comment = Comment("The one-to-many fallback: the total quantity on blank-ref lines with our symbol, side "
+                                 "and trade date. If it equals our quantity, those lines are our fills.", "trade-recon")
+    ws_r["I1"].comment = Comment("INDEX/MATCH lookup, used only when exactly one line carries our ID. The Excel 365 "
+                                 "equivalent is =XLOOKUP(A2,Broker!$A$2:$A$520,Broker!$N$2:$N$520,\"\")", "trade-recon")
+    ws_r["Q1"].comment = Comment("A 0/1 flag. Counting breaks with COUNTIFS(range,\"<>\") would be wrong here: "
                                  "a formula that returns \"\" still counts as not empty.", "trade-recon")
     R = lambda col: f"Recon!${col}$2:${col}${li}"
 
@@ -203,40 +218,44 @@ def build_twin(internal, broker_raw, report, path: Path) -> None:
     s["B6"], s["C6"] = "USD per 1 HKD", config.USD_PER["HKD"]
     s["C5"].font = s["C6"].font = INPUT
     s["D6"], s["D6"].font = "Fixed rate from config.py, used for ranking only. HKD is pegged near 7.8 per USD.", NOTE
+    s["B7"], s["C7"] = "Fee tolerance", config.TOLERANCE["fees"]
+    s["C7"].font = INPUT
+    s["D7"], s["D7"].font = "From config.py, in local currency. A fee difference this small or smaller is not a break.", NOTE
 
     # totals check
-    s["A8"], s["A8"].font = "Totals check, local currency", BOLD
-    hdr = ["currency", "our cash", "broker cash", "gap", "sum of Excel breaks", "unexplained", "ok"]
+    s["A9"], s["A9"].font = "Totals check, local currency", BOLD
+    hdr = ["currency", "our cash", "broker cash", "gap", "sum of Excel breaks", "within tolerance", "unexplained", "ok"]
     for c, h in enumerate(hdr, start=1):
-        s.cell(row=9, column=c, value=h)
-    style_header(s, 9, len(hdr))
+        s.cell(row=10, column=c, value=h)
+    style_header(s, 10, len(hdr))
     for i, ccy in enumerate(["HKD", "USD"]):
-        r = 10 + i
+        r = 11 + i
         s.cell(row=r, column=1, value=ccy)
         s.cell(row=r, column=2, value=f"=SUMIFS(Internal!$O$2:$O${li},Internal!$J$2:$J${li},A{r})")
         s.cell(row=r, column=3, value=f"=SUMIFS({B('Q')},{B('F')},A{r})")
         s.cell(row=r, column=4, value=f"=ROUND(B{r}-C{r},2)")
-        s.cell(row=r, column=5, value=f"=SUMIFS({R('M')},{R('C')},A{r})")
-        s.cell(row=r, column=6, value=f"=ROUND(D{r}-E{r},2)")
-        s.cell(row=r, column=7, value=f"=F{r}=0")
-        for c in range(2, 7):
+        s.cell(row=r, column=5, value=f"=SUMIFS({R('O')},{R('C')},A{r},{R('Q')},1)")
+        s.cell(row=r, column=6, value=f"=SUMIFS({R('O')},{R('C')},A{r},{R('Q')},0)")
+        s.cell(row=r, column=7, value=f"=ROUND(D{r}-E{r}-F{r},2)")
+        s.cell(row=r, column=8, value=f"=G{r}=0")
+        for c in range(2, 8):
             s.cell(row=r, column=c).number_format = MONEY
 
     # by type
     types = report.groupby("break_type").agg(count=("rank", "size"), impact=("impact_usd", "sum")).round(2)
     types = types.sort_values("impact", ascending=False)
-    s["A13"], s["A13"].font = "By break type", BOLD
+    s["A14"], s["A14"].font = "By break type", BOLD
     hdr = ["break type", "Excel count", "pandas count", "Excel impact USD", "pandas impact USD", "ok"]
     for c, h in enumerate(hdr, start=1):
-        s.cell(row=14, column=c, value=h)
-    style_header(s, 14, len(hdr))
-    r = 15
+        s.cell(row=15, column=c, value=h)
+    style_header(s, 15, len(hdr))
+    r = 16
     first_type = r
     for name, row in types.iterrows():
         s.cell(row=r, column=1, value=name)
-        s.cell(row=r, column=2, value=f"=COUNTIFS({R('N')},A{r})")
+        s.cell(row=r, column=2, value=f"=COUNTIFS({R('P')},A{r})")
         s.cell(row=r, column=3, value=int(row["count"])).font = INPUT
-        s.cell(row=r, column=4, value=f"=SUMIFS({R('P')},{R('N')},A{r})").number_format = MONEY
+        s.cell(row=r, column=4, value=f"=SUMIFS({R('R')},{R('P')},A{r})").number_format = MONEY
         s.cell(row=r, column=5, value=float(row["impact"])).font = INPUT
         s.cell(row=r, column=5).number_format = MONEY
         s.cell(row=r, column=6, value=f"=AND(B{r}=C{r},ROUND(D{r}-E{r},2)=0)")
@@ -247,7 +266,7 @@ def build_twin(internal, broker_raw, report, path: Path) -> None:
     s.cell(row=r, column=3, value=f"=SUM(C{first_type}:C{last_type})")
     s.cell(row=r, column=4, value=f"=SUM(D{first_type}:D{last_type})").number_format = MONEY
     s.cell(row=r, column=5, value=f"=SUM(E{first_type}:E{last_type})").number_format = MONEY
-    s.cell(row=r, column=6, value=f"=AND(B{r}=SUM({R('O')}),B{r}=C{r},ROUND(D{r}-E{r},2)=0)")
+    s.cell(row=r, column=6, value=f"=AND(B{r}=SUM({R('Q')}),B{r}=C{r},ROUND(D{r}-E{r},2)=0)")
     total_row = r
 
     # by broker
@@ -264,9 +283,9 @@ def build_twin(internal, broker_raw, report, path: Path) -> None:
     first_broker = r
     for name, row in brokers.iterrows():
         s.cell(row=r, column=1, value=name)
-        s.cell(row=r, column=2, value=f"=SUMIFS({R('O')},{R('D')},A{r})")
+        s.cell(row=r, column=2, value=f"=SUMIFS({R('Q')},{R('D')},A{r})")
         s.cell(row=r, column=3, value=int(row["count"])).font = INPUT
-        s.cell(row=r, column=4, value=f"=SUMIFS({R('P')},{R('D')},A{r})").number_format = MONEY
+        s.cell(row=r, column=4, value=f"=SUMIFS({R('R')},{R('D')},A{r})").number_format = MONEY
         s.cell(row=r, column=5, value=float(row["impact"])).font = INPUT
         s.cell(row=r, column=5).number_format = MONEY
         s.cell(row=r, column=6, value=f"=AND(B{r}=C{r},ROUND(D{r}-E{r},2)=0)")
@@ -276,7 +295,7 @@ def build_twin(internal, broker_raw, report, path: Path) -> None:
     # verdict
     r += 1
     s.cell(row=r, column=1, value="Every check passes").font = BOLD
-    s.cell(row=r, column=2, value=f"=AND(G10,G11,AND(F{first_type}:F{total_row}),AND(F{first_broker}:F{last_broker}))").font = BOLD
+    s.cell(row=r, column=2, value=f"=AND(H11,H12,AND(F{first_type}:F{total_row}),AND(F{first_broker}:F{last_broker}))").font = BOLD
     verdict_row = r
 
     # lookup panel
@@ -290,8 +309,8 @@ def build_twin(internal, broker_raw, report, path: Path) -> None:
               f"=XLOOKUP($B${r+1},Internal!$A$2:$A${li},Internal!$I$2:$I${li})"),
              ("broker price", f'=IFERROR(INDEX({B("E")},MATCH($B${r+1},{B("A")},0)),"not found")',
               f'=XLOOKUP($B${r+1},{B("A")},{B("E")},"not found")'),
-             ("break type", f"=INDEX({R('N')},MATCH($B${r+1},{R('A')},0))", f"=XLOOKUP($B${r+1},{R('A')},{R('N')})"),
-             ("cash difference", f"=INDEX({R('M')},MATCH($B${r+1},{R('A')},0))", f"=XLOOKUP($B${r+1},{R('A')},{R('M')})")]
+             ("break type", f"=INDEX({R('P')},MATCH($B${r+1},{R('A')},0))", f"=XLOOKUP($B${r+1},{R('A')},{R('P')})"),
+             ("cash difference", f"=INDEX({R('O')},MATCH($B${r+1},{R('A')},0))", f"=XLOOKUP($B${r+1},{R('A')},{R('O')})")]
     s.cell(row=r + 2, column=3, value="The same lookup written with XLOOKUP, for you to type yourself:").font = NOTE
     for k, (label, formula, xl) in enumerate(items):
         rr = r + 3 + k
@@ -302,7 +321,7 @@ def build_twin(internal, broker_raw, report, path: Path) -> None:
         shown.font = NOTE
         if "price" in label or "cash" in label:
             s.cell(row=rr, column=2).number_format = MONEY
-    set_widths(s, {"A": 22, "B": 18, "C": 18, "D": 20, "E": 20, "F": 14, "G": 8})
+    set_widths(s, {"A": 22, "B": 18, "C": 18, "D": 20, "E": 20, "F": 16, "G": 14, "H": 8})
 
     # ---- Read me
     lines = [
@@ -324,7 +343,8 @@ def build_twin(internal, broker_raw, report, path: Path) -> None:
         ("", PLAIN),
         ("Known limits", BOLD),
         ("The Excel break_type formula names one break per trade, checked in a fixed order. The Python engine also reports several wrong fields on one trade.", PLAIN),
-        ("A trade paired by the fallback is not compared field by field here. The generator only blanks the reference of otherwise clean trades.", PLAIN),
+        ("A trade paired by a fallback, or reported as several fills, is checked on cash only, not field by field. The generator only does this to otherwise clean trades.", PLAIN),
+        ("Fills: when the lines carrying our ID add up to our quantity they are fills of one trade. When they add up to double, the trade was sent twice.", PLAIN),
         ("Lookups use INDEX and MATCH so the file opens in any spreadsheet program. The XLOOKUP form of each is shown on the Summary sheet.", PLAIN),
         ("There is no pivot table in this file. Building one on the Recon sheet is one of your tasks: rows break_type, values count of is_break and sum of impact_usd.", PLAIN),
     ]
@@ -358,6 +378,9 @@ def build_practice(internal, broker_raw, report, path: Path) -> None:
     usd_i, usd_b = internal["currency"] == "USD", broker_raw["ccy"] == "USD"
     refs = broker_raw.loc[broker_raw["ref"] != "", "ref"]
     counts = refs.value_counts()
+    qty_by_ref = broker_raw[broker_raw["ref"] != ""].assign(q=lambda d: d["qty"].astype(int)).groupby("ref")["q"].sum()
+    our_qty = internal.set_index("trade_id")["quantity"]
+    n_duplicates = int(sum(1 for ref in counts[counts > 1].index if qty_by_ref[ref] == 2 * our_qty[ref]))
 
     rows = [
         # (task, hint, target, number format)
@@ -370,14 +393,16 @@ def build_practice(internal, broker_raw, report, path: Path) -> None:
         ("How many of our trade IDs appear nowhere in the broker's ref column?",
          "XLOOKUP with a not-found value, or COUNTIFS equal to 0.", int((~internal["trade_id"].isin(refs)).sum()), "0"),
         ("How many different IDs appear more than once in the broker's ref column?",
-         "COUNTIFS. XLOOKUP cannot see this.", int((counts > 1).sum()), "0"),
+         "COUNTIFS. XLOOKUP cannot see this. Some are duplicates and some are fills.", int((counts > 1).sum()), "0"),
+        ("Of those, how many are true duplicates: the lines add up to double our quantity?",
+         "SUMIFS the broker's qty by ref and compare with our quantity.", n_duplicates, "0"),
         ("How many broker lines have a blank ref?", "COUNTBLANK.", int((broker_raw["ref"] == "").sum()), "0"),
         ("How many broker lines have a sym that is not already clean upper-case text?",
          "Compare sym with UPPER(TRIM(CLEAN(sym))) using EXACT.",
          int((broker_raw["sym"] != broker_raw["sym"].str.strip().str.upper()).sum()), "0"),
         ("How many broker lines write settle_dt as 8 digits, like 20261117?",
          "LEN. Then parse them with DATE, LEFT, MID and RIGHT.", int((broker_raw["settle_dt"].str.len() == 8).sum()), "0"),
-        ("Among trades found by ID exactly once, how many have a broker price different from ours?",
+        ("Among trades whose ID appears on exactly one broker line, how many have a broker price different from ours?",
          "Look up px, subtract, ROUND to 4 places before comparing.", int((report["break_type"] == "PRICE").sum()), "0"),
         ("Total impact in USD of every break, at 0.128 USD per HKD.",
          "The full reconciliation. See the Recon sheet of recon_twin.xlsx only after you have tried.",
@@ -431,6 +456,10 @@ def build_practice(internal, broker_raw, report, path: Path) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Build the Excel twin and the practice workbook.")
+    parser.add_argument("--practice", default="excel/practice.xlsx", help="where to write the practice workbook")
+    args = parser.parse_args()
+
     internal = pd.read_csv("data/internal_blotter.csv")
     for col in ("trade_date", "settle_date"):
         internal[col] = pd.to_datetime(internal[col]).dt.date
@@ -439,8 +468,8 @@ def main() -> None:
     report = pd.read_csv("reports/break_report.csv")
 
     build_twin(internal, broker_raw, report, Path("excel/recon_twin.xlsx"))
-    build_practice(internal, broker_raw, report, Path("excel/practice.xlsx"))
-    print("wrote excel/recon_twin.xlsx and excel/practice.xlsx")
+    build_practice(internal, broker_raw, report, Path(args.practice))
+    print(f"wrote excel/recon_twin.xlsx and {args.practice}")
 
 
 if __name__ == "__main__":
